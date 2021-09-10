@@ -326,11 +326,15 @@ class AdaptiveAggregationModule(nn.Module):
         self.branches = nn.ModuleList()
 
         # Adaptive intra-scale aggregation
+        # ISA 模块是对3个scale的分支的cost volume分别进行代价聚合（卷积模块，可以选择普通卷积还是可变形卷积）
         for i in range(self.num_scales):
+            # max_disp 是根据 downsampleing 调整, 每个scale的cost volume的视差等于 原图像视差 / scale的下采样倍数 
             num_candidates = max_disp // (2 ** i)
             branch = nn.ModuleList()
+            # 选择堆叠 block 的个数
             for j in range(num_blocks):
                 if simple_bottleneck:
+                    # num_candidates 表示输入通道 输出通道 中间可以选择升通道
                     branch.append(SimpleBottleneck(num_candidates, num_candidates))
                 else:
                     branch.append(DeformSimpleBottleneck(num_candidates, num_candidates, modulation=True,
@@ -343,6 +347,8 @@ class AdaptiveAggregationModule(nn.Module):
 
         # Adaptive cross-scale aggregation
         # For each output branch
+        # i 表示论文 Eq(6) 中的 s
+        # j 表示论文 Eq(6) 中的 k
         for i in range(self.num_output_branches):
             self.fuse_layers.append(nn.ModuleList())
             # For each branch (different scale)
@@ -351,6 +357,7 @@ class AdaptiveAggregationModule(nn.Module):
                     # Identity
                     self.fuse_layers[-1].append(nn.Identity())
                 elif i < j:
+                    # 升通道
                     self.fuse_layers[-1].append(
                         nn.Sequential(nn.Conv2d(max_disp // (2 ** j), max_disp // (2 ** i),
                                                 kernel_size=1, bias=False),
@@ -359,12 +366,13 @@ class AdaptiveAggregationModule(nn.Module):
                 elif i > j:
                     layers = nn.ModuleList()
                     for k in range(i - j - 1):
+                        # 降采样
                         layers.append(nn.Sequential(nn.Conv2d(max_disp // (2 ** j), max_disp // (2 ** j),
                                                               kernel_size=3, stride=2, padding=1, bias=False),
                                                     nn.BatchNorm2d(max_disp // (2 ** j)),
                                                     nn.LeakyReLU(0.2, inplace=True),
                                                     ))
-
+                    # 降采样 + 降通道
                     layers.append(nn.Sequential(nn.Conv2d(max_disp // (2 ** j), max_disp // (2 ** i),
                                                           kernel_size=3, stride=2, padding=1, bias=False),
                                                 nn.BatchNorm2d(max_disp // (2 ** i))))
@@ -374,17 +382,30 @@ class AdaptiveAggregationModule(nn.Module):
 
     def forward(self, x):
         assert len(self.branches) == len(x)
-
+        # ISA 模块的前向传播 x1 x2 x3 分别经过 branch1 branch2 branch3 分支
         for i in range(len(self.branches)):
             branch = self.branches[i]
             for j in range(self.num_blocks):
                 dconv = branch[j]
                 x[i] = dconv(x[i])
-
+        # 如果 num_scale = 1, 不存在交叉尺度模块 
         if self.num_scales == 1:  # without fusions
             return x
-
+        # CSA 模块的前向传播
+        # len(self.fuse_layers) 表示的是有几个输出分支; 一般默认同输入分支的个数; i表示论文 Eq(5) 中的 s
+        # len(self.branches) 表示的是有几个输入分支即论文中的S; 一般默认同输出分支的个数; j表示论文 Eq(5) 中的 k
         x_fused = []
+        # x_fused1 = x1
+        # x_fused1 = x2(升通道得exchange, exchange上采样到x_fused1的size) + x_fused1
+        # x_fused1 = x3(升通道得exchange, exchange上采样到x_fused1的size) + x_fused1
+        # —————————————
+        # x_fused2 = x1(下采样, 降通道)
+        # x_fused2 = x2 + x_fused2
+        # x_fused2 = x3(升通道得exchange, exchange上采样到x_fused2的size) + x_fused2
+        # —————————————
+        # x_fused3 = x1(下采样, 降通道)
+        # x_fused3 = x2(下采样, 降通道) + x_fused3
+        # x_fused3 = x3 + x_fused3
         for i in range(len(self.fuse_layers)):
             for j in range(len(self.branches)):
                 if j == 0:
@@ -421,6 +442,7 @@ class AdaptiveAggregation(nn.Module):
         for i in range(num_fusions):
             if self.intermediate_supervision:
                 num_out_branches = self.num_scales
+            # self.intermediate_supervision = False 则最后一个AAModule只输出 1/3 尺寸的结果，前5个仍保持 num_scales 个 输出分支
             else:
                 num_out_branches = 1 if i == num_fusions - 1 else self.num_scales
 
@@ -428,7 +450,7 @@ class AdaptiveAggregation(nn.Module):
                 simple_bottleneck_module = False
             else:
                 simple_bottleneck_module = True
-
+            # 6个AAModule的堆叠
             fusions.append(AdaptiveAggregationModule(num_scales=self.num_scales,
                                                      num_output_branches=num_out_branches,
                                                      max_disp=max_disp,
